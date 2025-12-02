@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/emersion/go-imap"
 	"github.com/greeddj/imapsync-go/internal/cache"
@@ -26,7 +27,7 @@ type FolderSyncPlan struct {
 	DestinationFolder       string
 	DestinationFolderExists bool
 	NewMessages             int
-	MessagesToSync          []*imap.Message
+	NewMessageIDs           map[string]bool // IDs only - bodies streamed during sync
 }
 
 // SyncSummary aggregates the per-folder plans along with total message counts.
@@ -123,14 +124,8 @@ func Sync(cCtx *cli.Context) error {
 		foldersToCreate := make([]string, 0, len(summary.Plans))
 		for _, plan := range summary.Plans {
 			foldersToCreate = append(foldersToCreate, plan.DestinationFolder)
-			if len(plan.MessagesToSync) > 0 {
-				fmt.Printf("· %s → %s will copy messages %d\n", plan.SourceFolder, plan.DestinationFolder, len(plan.MessagesToSync))
-				if verbose {
-					for _, msg := range plan.MessagesToSync {
-						fmt.Printf("  · %s (ID: %s)\n", msg.Envelope.Subject, msg.Envelope.MessageId)
-					}
-					fmt.Println()
-				}
+			if plan.NewMessages > 0 {
+				fmt.Printf("· %s → %s will copy %d messages\n", plan.SourceFolder, plan.DestinationFolder, plan.NewMessages)
 			}
 		}
 
@@ -182,7 +177,7 @@ func Sync(cCtx *cli.Context) error {
 			}
 		}
 
-		synced, errors := syncFolders(cfg, plan.DestinationFolder, plan.MessagesToSync, cfg.Workers, spin, verbose)
+		synced, errors := syncFolders(cfg, srcClient, plan.SourceFolder, plan.DestinationFolder, plan.NewMessageIDs, cfg.Workers, spin, verbose)
 		totalSynced += synced
 		totalErrors += errors
 
@@ -216,13 +211,26 @@ func Sync(cCtx *cli.Context) error {
 	return nil
 }
 
-// syncFolders syncs messages using multiple parallel workers.
-func syncFolders(cfg *config.Config, dstFolder string, messages []*imap.Message, numWorkers int, spin *stdout.Spinner, verbose bool) (int, int) {
+// syncFolders syncs messages using streaming producer and parallel upload workers.
+func syncFolders(cfg *config.Config, srcClient *client.Client, srcFolder, dstFolder string,
+	messageIDs map[string]bool, numWorkers int, spin *stdout.Spinner, verbose bool) (int, int) {
+
 	jobs := make(chan *imap.Message, jobChannelBuffer)
 	var wg sync.WaitGroup
 	var syncedCount int64
 	var errorCount int64
+	totalMessages := len(messageIDs)
 
+	// Producer goroutine: stream messages from source
+	go func() {
+		defer close(jobs)
+		if err := srcClient.StreamMessagesByIDs(srcFolder, messageIDs, jobs); err != nil {
+			spin.Update(fmt.Sprintf("Producer error: %v", err))
+			atomic.AddInt64(&errorCount, 1)
+		}
+	}()
+
+	// Worker goroutines: upload to destination
 	for i := range numWorkers {
 		wg.Add(1)
 		go func(workerID int) {
@@ -242,20 +250,16 @@ func syncFolders(cfg *config.Config, dstFolder string, messages []*imap.Message,
 
 			for msg := range jobs {
 				if err := workerClient.AppendMessage(dstFolder, msg); err != nil {
-					workerClient.UpdateProgress(fmt.Sprintf("Worker %d: error syncing dir %s on message: %v", workerID, dstFolder, err))
+					spin.Print(fmt.Sprintf("[%s] Error: Worker %d syncing %s: %v",
+						time.Now().Format("2006-01-02 15:04:05"), workerID, dstFolder, err))
 					atomic.AddInt64(&errorCount, 1)
 				} else {
 					atomic.AddInt64(&syncedCount, 1)
-					workerClient.UpdateProgress(fmt.Sprintf("Syncing dir %s [messages %d/%d]", dstFolder, atomic.LoadInt64(&syncedCount), len(messages)))
+					workerClient.UpdateProgress(fmt.Sprintf("Syncing dir %s [messages %d/%d]", dstFolder, atomic.LoadInt64(&syncedCount), totalMessages))
 				}
 			}
 		}(i)
 	}
-
-	for _, msg := range messages {
-		jobs <- msg
-	}
-	close(jobs)
 
 	wg.Wait()
 
@@ -341,24 +345,16 @@ func buildSyncPlan(srcClient, dstClient *client.Client, mappings []config.Direct
 
 		spin.Update(fmt.Sprintf("Folder %s: %d new messages to sync (of %d total)", srcFolder, len(newIDs), len(srcMessageIDs)))
 
-		// Fetch full bodies only for messages that need syncing
-		messagesToSync, err := srcClient.FetchMessagesByIDs(srcFolder, newIDs)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch messages from %s: %w", srcFolder, err)
+		// Store IDs only - bodies will be streamed during sync
+		plan := FolderSyncPlan{
+			SourceFolder:            srcFolder,
+			DestinationFolder:       dstFolder,
+			DestinationFolderExists: dstFolderExists,
+			NewMessages:             len(newIDs),
+			NewMessageIDs:           newIDs,
 		}
-		spin.Flush() // Print body fetch status and start new line
-
-		if len(messagesToSync) > 0 {
-			plan := FolderSyncPlan{
-				SourceFolder:            srcFolder,
-				DestinationFolder:       dstFolder,
-				DestinationFolderExists: dstFolderExists,
-				NewMessages:             len(messagesToSync),
-				MessagesToSync:          messagesToSync,
-			}
-			summary.Plans = append(summary.Plans, plan)
-			summary.TotalNew += len(messagesToSync)
-		}
+		summary.Plans = append(summary.Plans, plan)
+		summary.TotalNew += len(newIDs)
 	}
 
 	return summary, nil
